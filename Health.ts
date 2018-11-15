@@ -3,6 +3,7 @@ import * as Pmx from "pmx";
 import * as Fs from "fs";
 import { basename } from "path";
 import { Mail, ISmtpConfig } from "./Mail";
+import { Slack, ISlackConfig, SlackAttachement } from './Slack';
 import { Snapshot, IShapshotConfig, IAuth } from "./Snapshot";
 import { Fetch } from "planck-http-fetch";
 import { info, error } from "./Log";
@@ -48,7 +49,7 @@ interface IMonitConfig {
     aliveTimeoutS: number;
 }
 
-interface IConfig extends IMonitConfig, ISmtpConfig, IShapshotConfig {
+interface IConfig extends IMonitConfig, ISmtpConfig, ISlackConfig, IShapshotConfig {
     webConfig: {
         url: string;
         auth?: IAuth;
@@ -58,6 +59,7 @@ interface IConfig extends IMonitConfig, ISmtpConfig, IShapshotConfig {
 
 export class Health {
     readonly _mail: Mail;
+    readonly _slack: Slack;
     readonly _snapshot: Snapshot;
     _holdTill: Date = null;
 
@@ -71,6 +73,7 @@ export class Health {
             this._config.metric = {};
 
         this._mail = new Mail(_config);
+        this._slack = new Slack(_config);
         this._snapshot = new Snapshot(this._config);
     }
 
@@ -141,14 +144,26 @@ export class Health {
                     if (Array.isArray(this._config.events) && this._config.events.indexOf(data.event) === -1)
                         return;
 
+                    const subject = `${data.process.name}:${data.process.pm_id} - ${data.event}`;
+
                     this.mail(
-                        `${data.process.name}:${data.process.pm_id} - ${data.event}`,
+                        subject,
                         `
                         <p>App: <b>${data.process.name}:${data.process.pm_id}</b></p>
                         <p>Event: <b>${data.event}</b></p>
                         <pre>${JSON.stringify(data, undefined, 4)}</pre>`,
                         "high",
                         LOGS.filter(e => this._config.addLogs === true && data.process[e]).map(e => ({ filename: basename(data.process[e]), path: data.process[e] })));
+
+                    this.slack(
+                        subject,
+                        [{
+                            title: `App: ${data.process.name}:${data.process.pm_id}`,
+                            text: JSON.stringify(data, undefined, 4),
+                            fields: [{ title: 'Event', value: data.event }],
+                            color: Slack.COLORS.high,
+                            // TODO: read logs and send in slack msg
+                        }]);
                 });
 
                 if (this._config.exceptions)
@@ -156,12 +171,22 @@ export class Health {
                         if (this.isAppExcluded(data.process.name))
                             return;
 
+                        const subject = `${data.process.name}:${data.process.pm_id} - exception`;
+
                         this.mail(
-                            `${data.process.name}:${data.process.pm_id} - exception`,
+                            subject,
                             `
                             <p>App: <b>${data.process.name}:${data.process.pm_id}</b></p>                            
                             <pre>${JSON.stringify(data.data, undefined, 4)}</pre>`,
                             "high");
+
+                        this.slack(
+                            subject,
+                            [{
+                                title: `App: ${data.process.name}:${data.process.pm_id}`,
+                                text: JSON.stringify(data.data, undefined, 4),
+                                color: Slack.COLORS.high,
+                            }]);
                     });
 
                 if (this._config.messages)
@@ -179,11 +204,20 @@ export class Health {
                         if (this._messageExcludeExps.some(e => e.test(json)))
                             return; // exclude
 
+                        const subject = `${data.process.name}:${data.process.pm_id} - message`;
+
                         this.mail(
-                            `${data.process.name}:${data.process.pm_id} - message`,
+                            subject,
                             `
                             <p>App: <b>${data.process.name}:${data.process.pm_id}</b></p>
                             <pre>${json}</pre>`);
+
+                        this.slack(
+                            subject,
+                            [{
+                                title: `App: ${data.process.name}:${data.process.pm_id}`,
+                                text: json,
+                            }])
                     });
             });
 
@@ -201,14 +235,14 @@ export class Health {
             this._holdTill = new Date();
             this._holdTill.setTime(this._holdTill.getTime() + t * 60000);
 
-            const msg = `mail held for ${t} minutes, till ${this._holdTill.toISOString()}`;
+            const msg = `mail/slack held for ${t} minutes, till ${this._holdTill.toISOString()}`;
             info(msg);
             reply(msg);
         });
 
         Pmx.action("unheld", (reply) => {
             this._holdTill = null;
-            reply(`mail unheld`);
+            reply(`mail/slack unheld`);
         });
 
         Pmx.action("mail", async (reply) => {
@@ -218,6 +252,16 @@ export class Health {
             }
             catch (ex) {
                 reply(`mail failed: ${ex.message || ex}`);
+            }
+        });
+
+        Pmx.action("slack", async (reply) => {
+            try {
+                await this._slack.send("Test only", [{ title: "This is test only." }]);
+                reply(`slack sent`);
+            }
+            catch (ex) {
+                reply(`slack failed: ${ex.message || ex}`);
             }
         });
 
@@ -248,23 +292,37 @@ export class Health {
             process.name,
             setTimeout(() => {
                 info(`death ${process.name}:${process.pm_id}, count ${count}`);
+                const subject = `${process.name}:${process.pm_id} - is death!`;
 
                 this.mail(
-                    `${process.name}:${process.pm_id} - is death!`,
+                    subject,
                     `
                     <p>App: <b>${process.name}:${process.pm_id}</b></p>
                     <p>This is <b>${count}/${ALIVE_MAX_CONSECUTIVE_TESTS}</b> consecutive notice.</p>`,
                     "high");
+
+                this.slack(
+                    subject,
+                    [{
+                        title: `App: ${process.name}:${process.pm_id}`,
+                        text: `This is ${Slack.format(count + '/' + ALIVE_MAX_CONSECUTIVE_TESTS)} consecutive notice.`,
+                        color: Slack.COLORS.high,
+                    }]);
 
                 if (count < ALIVE_MAX_CONSECUTIVE_TESTS)
                     this.aliveReset(process, ALIVE_CONSECUTIVE_TIMEOUT_S, count + 1);
             }, timeoutS * 1000));
     }
 
-    private async mail(subject: string, body: string, priority?: "high" | "low", attachements = []) {
+    private hold() {
         const t = new Date();
         if (this._holdTill != null && t < this._holdTill)
-            return; // skip
+            return true; //skip
+        return false;
+    }
+
+    private async mail(subject: string, body: string, priority?: "high" | "low", attachements = []) {
+        if (this.hold()) return;
 
         try {
             await this._mail.send(subject, body, priority, attachements);
@@ -275,8 +333,27 @@ export class Health {
         }
     }
 
+    private async slack(subject: string, attachements: SlackAttachement[] = []) {
+        if (this.hold()) return;
+
+        try {
+            await this._slack.send(subject, attachements);
+            info(`slack [${subject}] sent`);
+        }
+        catch (ex) {
+            error(`slack failed -> ${ex.message || ex}`);
+        }
+    }
+
     private testProbes() {
-        const alerts = [];
+        const alerts: {
+            name: any,
+            id: any,
+            key: any,
+            v: any,
+            lastV: any,
+            targetV: any,
+        }[] = [];
 
         PM2.list(async (ex, list) => {
             stopIfEx(ex);
@@ -328,7 +405,14 @@ export class Health {
 
                     // test
                     if (probe.noNotify !== true && bad === true && (probe.ifChanged !== true || this._snapshot.last(app.pm_id, key) !== v))
-                        alerts.push(`<tr><td>${app.name}:${app.pm_id}</td><td>${key}</td><td>${v}</td><td>${this._snapshot.last(app.pm_id, key)}</td><td>${probe.target}</td></tr>`);
+                        alerts.push({
+                            name: app.name,
+                            id: app.pm_id,
+                            key,
+                            v,
+                            lastV: this._snapshot.last(app.pm_id, key),
+                            targetV: probe.target,
+                        })
 
                     const data: any = { v }
                     if (bad)    // safe space by not storing false
@@ -341,17 +425,30 @@ export class Health {
             this._snapshot.inactivate();
             await this._snapshot.send();
 
-            if (alerts.length > 0)
-                this.mail(
-                    `${alerts.length} alert(s)`,
+            if (alerts.length > 0) {
+                const subject = `${alerts.length} alert(s)`;
+
+                this.mail(subject,
                     `
                     <table>
                         <tr>
                             <th>App</th><th>Metric</th><th>Value</th><th>Prev. Value</th><th>Target</th>
                         </tr>
-                        ${alerts.join("")}
+                        ${alerts
+                        .map(alert => `<tr><td>${alert.name}:${alert.id}</td><td>${alert.key}</td><td>${alert.v}</td><td>${alert.lastV}</td><td>${alert.targetV}</td></tr>`)
+                        .join("")}
                     </table>`,
                     "high");
+
+                this.slack(subject,
+                    alerts.map((alert) => {
+                        return {
+                            title: `App: ${alert.name}:${alert.id}`,
+                            fields: [{ title: 'Metric', value: alert.key }, { title: 'Value', value: alert.v }, { title: 'Prev. Value', value: alert.lastV }, { title: 'Target Value', value: alert.targetV }],
+                            color: Slack.COLORS.high,
+                        };
+                    }));
+            }
 
             setTimeout(
                 () => { this.testProbes(); },
